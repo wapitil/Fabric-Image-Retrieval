@@ -1,4 +1,4 @@
-# DINOv2 Image Retrieval Workspace
+# DINOv2 Fabric-Image-Retrieval
 
 一个基于 DINOv2 的本地图像反查小工具，支持：
 
@@ -8,6 +8,8 @@
 - 在确认后删除已经复制对应的图库源图
 - 输出检索结果、日志和历史记录到结果目录
 
+运行效果如下：
+![alt text](./assets/image.png)
 ## 目录结构
 
 - `retrieval_gui.py`
@@ -74,4 +76,4 @@ python cuda_check.py
 - IDE 配置和日志
 - `dinov2_retrieval_3class_result/`
 - `*.pth`
-# Fabric-Image-Retrieval
+
