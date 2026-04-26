@@ -77,10 +77,21 @@ def get_file_info(image_path):
     }
 
 
+def get_image_signature(image_path):
+    stat = os.stat(image_path)
+    return {
+        "path": os.path.abspath(image_path),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
 def get_gallery_signature(gallery_image_list):
     return {
         "gallery_dir": os.path.abspath(gallery_dir),
         "gallery_recursive": gallery_recursive,
+        "dinov2_repo_or_dir": dinov2_repo_or_dir,
+        "dinov2_source": dinov2_source,
         "dinov2_model_name": dinov2_model_name,
         "local_pretrained_path": os.path.abspath(local_pretrained_path) if local_pretrained_path else "",
         "patch_count_per_image": patch_count_per_image,
@@ -101,6 +112,28 @@ def get_gallery_cache_path(gallery_signature):
 def get_gallery_signature_hash(gallery_signature):
     signature_text = json.dumps(gallery_signature, ensure_ascii=False, sort_keys=True)
     return hashlib.md5(signature_text.encode("utf-8")).hexdigest()
+
+
+def get_gallery_cache_namespace():
+    return {
+        "gallery_dir": os.path.abspath(gallery_dir),
+        "gallery_recursive": gallery_recursive,
+        "dinov2_repo_or_dir": dinov2_repo_or_dir,
+        "dinov2_source": dinov2_source,
+        "dinov2_model_name": dinov2_model_name,
+        "local_pretrained_path": os.path.abspath(local_pretrained_path) if local_pretrained_path else "",
+        "patch_count_per_image": patch_count_per_image,
+        "patch_scale": patch_scale,
+        "input_size": input_size,
+        "image_suffixes": image_suffixes,
+    }
+
+
+def get_gallery_item_cache_path():
+    namespace = get_gallery_cache_namespace()
+    namespace_text = json.dumps(namespace, ensure_ascii=False, sort_keys=True)
+    namespace_hash = hashlib.md5(namespace_text.encode("utf-8")).hexdigest()
+    return os.path.join(feature_cache_dir, f"gallery_feature_items_{namespace_hash}.pt")
 
 
 def load_gallery_feature_cache(gallery_signature):
@@ -146,6 +179,143 @@ def save_gallery_feature_cache(gallery_signature, image_feature_matrix, patch_fe
         cache_path,
     )
     print(f"图库特征已缓存: {cache_path}")
+
+
+def load_gallery_item_feature_cache():
+    if not use_gallery_feature_cache:
+        return {}
+
+    cache_path = get_gallery_item_cache_path()
+    if not os.path.isfile(cache_path):
+        return {}
+
+    payload = torch.load(cache_path, map_location="cpu")
+    if payload.get("namespace") != get_gallery_cache_namespace():
+        return {}
+
+    raw_entries = payload.get("entries", {})
+    if not isinstance(raw_entries, dict):
+        return {}
+
+    entries = {}
+    for image_path, entry in raw_entries.items():
+        if not isinstance(entry, dict):
+            continue
+        image_feature = entry.get("image_feature")
+        patch_features = entry.get("patch_features")
+        if not isinstance(image_feature, torch.Tensor) or not isinstance(patch_features, torch.Tensor):
+            continue
+        entries[str(image_path)] = {
+            "signature": entry.get("signature"),
+            "image_feature": image_feature.float().cpu(),
+            "patch_features": patch_features.float().cpu(),
+        }
+    if entries:
+        print(f"读取图库增量特征缓存: {cache_path} | entries={len(entries)}")
+    return entries
+
+
+def save_gallery_item_feature_cache(entries):
+    if not use_gallery_feature_cache:
+        return
+
+    os.makedirs(feature_cache_dir, exist_ok=True)
+    cache_path = get_gallery_item_cache_path()
+    sanitized_entries = {}
+    for image_path, entry in entries.items():
+        image_feature = entry.get("image_feature")
+        patch_features = entry.get("patch_features")
+        if not isinstance(image_feature, torch.Tensor) or not isinstance(patch_features, torch.Tensor):
+            continue
+        sanitized_entries[str(image_path)] = {
+            "signature": entry.get("signature"),
+            "image_feature": image_feature.float().cpu(),
+            "patch_features": patch_features.float().cpu(),
+        }
+
+    torch.save(
+        {
+            "namespace": get_gallery_cache_namespace(),
+            "entries": sanitized_entries,
+        },
+        cache_path,
+    )
+    print(f"图库增量特征缓存已更新: {cache_path} | entries={len(sanitized_entries)}")
+
+
+def build_or_reuse_gallery_features(gallery_image_list, model, device, progress_desc):
+    gallery_signature = get_gallery_signature(gallery_image_list)
+    cached_feature_bundle = load_gallery_feature_cache(gallery_signature)
+    if cached_feature_bundle is not None and cached_feature_bundle.get("patch_feature_tensor") is not None:
+        return {
+            "gallery_signature": gallery_signature,
+            "image_feature_matrix": cached_feature_bundle["image_feature_matrix"].float(),
+            "patch_feature_tensor": cached_feature_bundle["patch_feature_tensor"].float(),
+            "cache_mode": "exact",
+        }
+
+    item_cache_entries = load_gallery_item_feature_cache()
+    ordered_image_features = [None] * len(gallery_image_list)
+    ordered_patch_features = [None] * len(gallery_image_list)
+    missing_indices = []
+    reused_count = 0
+
+    for index, image_path in enumerate(gallery_image_list):
+        normalized_path = os.path.abspath(image_path)
+        image_signature = get_image_signature(image_path)
+        cached_entry = item_cache_entries.get(normalized_path)
+        if cached_entry and cached_entry.get("signature") == image_signature:
+            ordered_image_features[index] = cached_entry["image_feature"].float().cpu()
+            ordered_patch_features[index] = cached_entry["patch_features"].float().cpu()
+            reused_count += 1
+        else:
+            missing_indices.append(index)
+
+    if missing_indices:
+        print(
+            f"图库增量缓存命中 {reused_count}/{len(gallery_image_list)}，"
+            f"开始补提 {len(missing_indices)} 张图片特征..."
+        )
+        total_batches = (len(missing_indices) + gallery_batch_size - 1) // gallery_batch_size
+        for batch_indices in tqdm(
+            chunked(missing_indices, gallery_batch_size),
+            total=total_batches,
+            desc=progress_desc,
+        ):
+            batch_image_list = [gallery_image_list[index] for index in batch_indices]
+            batch_feature_bundle = extract_feature_batch(batch_image_list, model, device)
+            batch_image_features = batch_feature_bundle["image_features"].float().cpu()
+            batch_patch_features = batch_feature_bundle["patch_features"].float().cpu()
+            for offset, image_index in enumerate(batch_indices):
+                image_path = os.path.abspath(gallery_image_list[image_index])
+                image_feature = batch_image_features[offset]
+                patch_features = batch_patch_features[offset]
+                ordered_image_features[image_index] = image_feature
+                ordered_patch_features[image_index] = patch_features
+                item_cache_entries[image_path] = {
+                    "signature": get_image_signature(image_path),
+                    "image_feature": image_feature,
+                    "patch_features": patch_features,
+                }
+    else:
+        print(f"图库增量缓存全命中，直接复用 {reused_count} 张图片特征。")
+
+    gallery_feature_matrix = torch.stack(ordered_image_features, dim=0).float()
+    gallery_patch_feature_tensor = torch.stack(ordered_patch_features, dim=0).float()
+    current_gallery_paths = {os.path.abspath(path) for path in gallery_image_list}
+    item_cache_entries = {
+        image_path: entry
+        for image_path, entry in item_cache_entries.items()
+        if image_path in current_gallery_paths
+    }
+    save_gallery_item_feature_cache(item_cache_entries)
+    save_gallery_feature_cache(gallery_signature, gallery_feature_matrix, gallery_patch_feature_tensor)
+    return {
+        "gallery_signature": gallery_signature,
+        "image_feature_matrix": gallery_feature_matrix,
+        "patch_feature_tensor": gallery_patch_feature_tensor,
+        "cache_mode": "incremental",
+    }
 
 
 def get_patch_list(image):
@@ -409,27 +579,14 @@ def ensure_gallery_resources(device):
         return runtime_cache
 
     model = get_or_load_model(device)
-    cached_feature_bundle = load_gallery_feature_cache(gallery_signature)
-    if cached_feature_bundle is None or cached_feature_bundle.get("patch_feature_tensor") is None:
-        print("未命中图库特征缓存，开始批量提取图库特征...")
-        gallery_image_feature_batches = []
-        gallery_patch_feature_batches = []
-        total_batches = (len(gallery_image_list) + gallery_batch_size - 1) // gallery_batch_size
-        for batch_image_list in tqdm(chunked(gallery_image_list, gallery_batch_size), total=total_batches, desc="图库建库"):
-            batch_feature_bundle = extract_feature_batch(batch_image_list, model, device)
-            gallery_image_feature_batches.append(batch_feature_bundle["image_features"])
-            gallery_patch_feature_batches.append(batch_feature_bundle["patch_features"])
-
-        if len(gallery_image_feature_batches) == 0:
-            raise RuntimeError("图库为空，无法进行检索。")
-
-        gallery_feature_matrix = torch.cat(gallery_image_feature_batches, dim=0)
-        gallery_patch_feature_tensor = torch.cat(gallery_patch_feature_batches, dim=0)
-        save_gallery_feature_cache(gallery_signature, gallery_feature_matrix, gallery_patch_feature_tensor)
-    else:
-        print("图库特征缓存命中，跳过图库建库。")
-        gallery_feature_matrix = cached_feature_bundle["image_feature_matrix"]
-        gallery_patch_feature_tensor = cached_feature_bundle["patch_feature_tensor"]
+    feature_bundle = build_or_reuse_gallery_features(
+        gallery_image_list=gallery_image_list,
+        model=model,
+        device=device,
+        progress_desc="图库建库",
+    )
+    gallery_feature_matrix = feature_bundle["image_feature_matrix"]
+    gallery_patch_feature_tensor = feature_bundle["patch_feature_tensor"]
 
     runtime_cache = {
         "gallery_image_list": gallery_image_list,

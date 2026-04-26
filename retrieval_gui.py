@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import os
@@ -39,10 +40,10 @@ THUMB_SIZE = 240
 REFERENCE_PREVIEW_SIZE = 280
 CARD_MIN_WIDTH = 240
 CARD_GAP = 16
-SIDEBAR_WIDTH = 380
+SIDEBAR_WIDTH = 336
 LOG_PANEL_HEIGHT = 170
-WINDOW_MIN_WIDTH = 1440
-WINDOW_MIN_HEIGHT = 900
+WINDOW_MIN_WIDTH = 1180
+WINDOW_MIN_HEIGHT = 760
 
 COLOR_BG = "#edf3f8"
 COLOR_PANEL = "#ffffff"
@@ -366,7 +367,7 @@ class ResultCard(QFrame):
 class RetrievalMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("DINOv2 图像反查工作台")
+        self.setWindowTitle("DINOv2 图片检索")
         self.resize(1600, 1020)
         self.setMinimumSize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
 
@@ -387,10 +388,14 @@ class RetrievalMainWindow(QMainWindow):
         self.recursive_enabled = retrieval_core.gallery_recursive
         self.auto_rerun_enabled = True
         self.display_limit = MAX_DISPLAY_COUNT
+        self.gallery_total_count = 0
+        self.gallery_remaining_count = 0
+        self.undo_snapshot = None
 
         self._build_ui()
         self.refresh_reference_preview()
         self.update_history_summary()
+        self.update_gallery_stats()
         self.update_feedback_summary()
         self.log(f"日志文件: {self.log_path}")
         self.show_startup_announcement()
@@ -407,9 +412,9 @@ class RetrievalMainWindow(QMainWindow):
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(22, 18, 22, 18)
         title_col = QVBoxLayout()
-        title = QLabel("图像反查工作台")
+        title = QLabel("DINOv2 图片检索")
         title.setObjectName("heroTitle")
-        subtitle = QLabel("参考图检索、人工筛选、反馈收敛和历史去重。")
+        subtitle = QLabel("选择参考图，筛选、复制并确认相似图片。")
         subtitle.setObjectName("heroSub")
         title_col.addWidget(title)
         title_col.addWidget(subtitle)
@@ -425,7 +430,8 @@ class RetrievalMainWindow(QMainWindow):
 
         sidebar_shell = QFrame()
         sidebar_shell.setObjectName("panel")
-        sidebar_shell.setFixedWidth(SIDEBAR_WIDTH)
+        sidebar_shell.setMinimumWidth(300)
+        sidebar_shell.setMaximumWidth(SIDEBAR_WIDTH)
         sidebar_layout = QVBoxLayout(sidebar_shell)
         sidebar_layout.setContentsMargins(0, 0, 0, 0)
         self.sidebar_scroll = QScrollArea()
@@ -455,7 +461,7 @@ class RetrievalMainWindow(QMainWindow):
         left_col = QVBoxLayout()
         result_title = QLabel("结果区")
         result_title.setObjectName("sectionTitle")
-        result_sub = QLabel("单击卡片切换 Accepted，双击卡片查看大图。")
+        result_sub = QLabel("单击卡片切换 Accepted，双击卡片查看大图；误触批量标记后可返回上一步。")
         result_sub.setObjectName("mutedText")
         left_col.addWidget(result_title)
         left_col.addWidget(result_sub)
@@ -469,32 +475,46 @@ class RetrievalMainWindow(QMainWindow):
         stats_bar.setObjectName("softPanel")
         stats_layout = QHBoxLayout(stats_bar)
         stats_layout.setContentsMargins(12, 10, 12, 10)
-        self.history_label = QLabel("历史已排除 0 张")
-        self.history_label.setObjectName("softText")
+        self.gallery_stats_label = QLabel("图库总数 0 张 | 未复制 0 张")
+        self.gallery_stats_label.setObjectName("softText")
         self.feedback_label = QLabel("反馈样本 accepted 0 | rejected 0")
         self.feedback_label.setObjectName("softText")
         hint_label = QLabel("灰=未处理，绿=Accepted，红=Rejected")
         hint_label.setObjectName("softText")
-        stats_layout.addWidget(self.history_label, 1)
+        stats_layout.addWidget(self.gallery_stats_label, 1)
         stats_layout.addWidget(self.feedback_label, 1)
         stats_layout.addWidget(hint_label, 0, Qt.AlignRight)
         result_header_layout.addWidget(stats_bar)
 
-        actions = QHBoxLayout()
+        actions = QGridLayout()
+        actions.setHorizontalSpacing(10)
+        actions.setVerticalSpacing(10)
         self.accept_all_btn = QPushButton("当前页全Accept")
+        self.accept_all_btn.setObjectName("acceptButton")
         self.accept_all_btn.clicked.connect(lambda: self.set_feedback_for_displayed("accepted"))
         self.clear_marks_btn = QPushButton("当前页清空标记")
         self.clear_marks_btn.clicked.connect(lambda: self.set_feedback_for_displayed("unlabeled"))
         self.reject_rest_btn = QPushButton("当前页未Accept设为Rejected")
+        self.reject_rest_btn.setObjectName("dangerButton")
         self.reject_rest_btn.clicked.connect(self.reject_current_unaccepted)
+        self.undo_btn = QPushButton("返回上一步")
+        self.undo_btn.clicked.connect(self.undo_last_action)
         self.copy_btn = QPushButton("复制 Accepted 图片")
         self.copy_btn.setObjectName("successButton")
         self.copy_btn.clicked.connect(self.copy_selected)
         self.clean_btn = QPushButton("删除已复制源图")
         self.clean_btn.clicked.connect(self.delete_copied_source_files)
-        for button in (self.accept_all_btn, self.clear_marks_btn, self.reject_rest_btn, self.copy_btn, self.clean_btn):
-            actions.addWidget(button)
-        actions.addStretch(1)
+        buttons = [
+            self.accept_all_btn,
+            self.clear_marks_btn,
+            self.reject_rest_btn,
+            self.undo_btn,
+            self.copy_btn,
+            self.clean_btn,
+        ]
+        for index, button in enumerate(buttons):
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            actions.addWidget(button, index // 3, index % 3)
         result_header_layout.addLayout(actions)
         right.addWidget(result_header, 0)
 
@@ -533,7 +553,7 @@ class RetrievalMainWindow(QMainWindow):
     def _build_sidebar(self):
         title = QLabel("检索设置")
         title.setObjectName("sectionTitle")
-        sub = QLabel("左侧区域可滚动，避免窗口高度不足时按钮和筛选项被截断。")
+        sub = QLabel("布局会随窗口变化自动收缩，适合不同桌面尺寸。")
         sub.setObjectName("mutedText")
         self.sidebar_body.addWidget(title)
         self.sidebar_body.addWidget(sub)
@@ -544,7 +564,7 @@ class RetrievalMainWindow(QMainWindow):
         self.gallery_edit = QLineEdit(self.gallery_path)
         self.target_edit = QLineEdit(self.target_path)
         self.reference_edit.textChanged.connect(self.on_reference_changed)
-        self.gallery_edit.textChanged.connect(lambda text: setattr(self, "gallery_path", text.strip()))
+        self.gallery_edit.textChanged.connect(self.on_gallery_changed)
         self.target_edit.textChanged.connect(lambda text: setattr(self, "target_path", text.strip()))
         field_layout.addWidget(self._row_with_picker("参考图", self.reference_edit, self.pick_reference))
         field_layout.addWidget(self._row_with_picker("图库目录", self.gallery_edit, self.pick_gallery))
@@ -585,7 +605,7 @@ class RetrievalMainWindow(QMainWindow):
         filter_layout.addWidget(apply_filter_button)
         action_layout.addWidget(filter_card)
 
-        hint = QLabel("单点 Accepted 只打标不重刷；批量 Rejected 和复制 Accepted 后可自动重新检索。")
+        hint = QLabel("单点 Accepted 只打标不重刷；批量操作误触后可返回上一步。")
         hint.setWordWrap(True)
         hint.setObjectName("mutedText")
         action_layout.addWidget(hint)
@@ -648,15 +668,15 @@ class RetrievalMainWindow(QMainWindow):
             QFrame#panel {{
                 background: {COLOR_PANEL};
                 border: 1px solid {COLOR_BORDER};
-                border-radius: 16px;
+                border-radius: 18px;
             }}
             QFrame#softPanel {{
                 background: {COLOR_SOFT_PANEL};
                 border: none;
-                border-radius: 14px;
+                border-radius: 16px;
             }}
             QLabel#heroTitle {{
-                font-size: 26px;
+                font-size: 24px;
                 font-weight: 700;
             }}
             QLabel#heroSub, QLabel#mutedText, QLabel#softText {{
@@ -685,18 +705,19 @@ class RetrievalMainWindow(QMainWindow):
             QPushButton {{
                 background: {COLOR_PANEL};
                 border: 1px solid {COLOR_BORDER};
-                border-radius: 12px;
-                padding: 10px 14px;
+                border-radius: 13px;
+                padding: 11px 14px;
                 font-weight: 600;
             }}
             QPushButton:hover {{
                 border-color: {COLOR_PRIMARY};
+                background: #f8fbff;
             }}
             QPushButton#primaryButton {{
                 background: {COLOR_PRIMARY};
                 color: white;
                 border-color: {COLOR_PRIMARY};
-                padding: 12px 16px;
+                padding: 13px 16px;
                 font-weight: 700;
             }}
             QPushButton#primaryButton:hover {{
@@ -707,11 +728,25 @@ class RetrievalMainWindow(QMainWindow):
                 color: white;
                 border-color: {COLOR_SUCCESS};
             }}
+            QPushButton#acceptButton {{
+                color: {COLOR_ACCEPTED_TEXT};
+                font-weight: 700;
+            }}
+            QPushButton#acceptButton:hover {{
+                background: #ecfdf5;
+            }}
+            QPushButton#dangerButton {{
+                color: {COLOR_REJECTED_TEXT};
+                font-weight: 700;
+            }}
+            QPushButton#dangerButton:hover {{
+                background: #fef2f2;
+            }}
             QLineEdit {{
                 background: white;
                 border: 1px solid {COLOR_BORDER};
-                border-radius: 10px;
-                padding: 8px 10px;
+                border-radius: 12px;
+                padding: 9px 12px;
             }}
             QScrollArea {{
                 border: none;
@@ -735,12 +770,12 @@ class RetrievalMainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "功能公告",
-            "欢迎使用 DINOv2 图像反查工作台。\n\n"
+            "欢迎使用 DINOv2 图片检索。\n\n"
             "当前版本主要功能：\n"
             "1. 选择参考图，对图库执行相似图检索。\n"
             "2. Accepted / Rejected 都会参与下一轮检索反馈。\n"
             "3. 检索分数融合整图相似度与 patch 局部匹配。\n"
-            "4. 支持复制 Accepted、删除已复制对应的图库源图。\n",
+            "4. 支持复制 Accepted、删除已复制对应的图库源图，并可返回上一步撤回误触标记。\n",
         )
 
     def log(self, message):
@@ -757,6 +792,10 @@ class RetrievalMainWindow(QMainWindow):
             self.target_path = default_target_dir(self.reference_path)
             self.target_edit.setText(self.target_path)
         self.update_feedback_summary()
+
+    def on_gallery_changed(self, text):
+        self.gallery_path = text.strip()
+        self.update_gallery_stats()
 
     def pick_reference(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择参考图", self.reference_path, "Images (*.bmp *.jpg *.jpeg *.png)")
@@ -776,6 +815,7 @@ class RetrievalMainWindow(QMainWindow):
         if path:
             self.gallery_path = path
             self.gallery_edit.setText(path)
+            self.update_gallery_stats()
             self.log(f"选择图库目录: {path}")
 
     def pick_target(self):
@@ -874,16 +914,13 @@ class RetrievalMainWindow(QMainWindow):
         return True
 
     def can_safely_delete_source_record(self, record):
-        context = self.get_current_context_paths()
         source_path = normalize_abs_path(record.get("source_path", ""))
         target_path = normalize_abs_path(record.get("target_path", ""))
 
         if not source_path:
             return False, "源文件路径为空"
-        if context["reference_path"] and source_path == context["reference_path"]:
-            return False, "源文件等于当前参考图"
-        if context["gallery_path"] and not is_same_or_child_path(source_path, context["gallery_path"]):
-            return False, "源文件不在当前图库目录下"
+        if not target_path:
+            return False, "目标副本路径为空"
         if target_path and source_path == target_path:
             return False, "源文件与保存副本是同一路径"
         return True, ""
@@ -898,13 +935,56 @@ class RetrievalMainWindow(QMainWindow):
         hidden.update(self.get_rejected_paths_for_reference(reference_path))
         return hidden
 
-    def update_history_summary(self):
-        excluded_count = len(self.get_excluded_source_paths())
-        pending_count = len([r for r in self.gui_history.get("copy_records", []) if not r.get("deleted_at")])
-        last_deleted_count = int(self.gui_history.get("last_deleted_count", 0))
-        self.history_label.setText(
-            f"历史已排除 {excluded_count} 张 | 待删源图 {pending_count} 张 | 上次删除源图 {last_deleted_count} 张"
+    def update_gallery_stats(self):
+        gallery_dir = self.gallery_edit.text().strip()
+        recursive = self.recursive_check.isChecked()
+        if not gallery_dir or not os.path.isdir(gallery_dir):
+            self.gallery_total_count = 0
+            self.gallery_remaining_count = 0
+            self.gallery_stats_label.setText("图库总数 0 张 | 未复制 0 张")
+            return
+
+        gallery_images = retrieval_core.get_image_list(gallery_dir, recursive=recursive)
+        gallery_abs_paths = {os.path.abspath(path) for path in gallery_images}
+        copied_source_paths = {
+            os.path.abspath(record.get("source_path", ""))
+            for record in self.gui_history.get("copy_records", [])
+            if record.get("source_path") and os.path.abspath(record.get("source_path", "")) in gallery_abs_paths
+        }
+
+        self.gallery_total_count = len(gallery_abs_paths)
+        self.gallery_remaining_count = max(0, self.gallery_total_count - len(copied_source_paths))
+        self.gallery_stats_label.setText(
+            f"图库总数 {self.gallery_total_count} 张 | 未复制 {self.gallery_remaining_count} 张"
         )
+
+    def save_undo_snapshot(self, reason):
+        self.undo_snapshot = {
+            "reason": reason,
+            "feedback_by_reference": copy.deepcopy(self.gui_history.get("feedback_by_reference", {})),
+        }
+
+    def undo_last_action(self):
+        if not self.undo_snapshot:
+            QMessageBox.information(self, "没有可撤回操作", "当前没有可返回的上一步标记操作。")
+            return
+
+        self.gui_history["feedback_by_reference"] = copy.deepcopy(
+            self.undo_snapshot.get("feedback_by_reference", {})
+        )
+        save_gui_history(self.gui_history)
+        reason = self.undo_snapshot.get("reason", "未知操作")
+        self.undo_snapshot = None
+        self.update_feedback_summary()
+        self.refresh_display_results()
+        self.set_status("已返回上一步")
+        self.log(f"返回上一步 | reason={reason}")
+        if self.auto_rerun_check.isChecked():
+            self.queue_feedback_rerun(f"撤回 {reason}")
+
+    def update_history_summary(self):
+        pending_count = len([r for r in self.gui_history.get("copy_records", []) if not r.get("deleted_at")])
+        self.clean_btn.setText(f"删除已复制源图 ({pending_count})")
 
     def update_feedback_summary(self):
         feedback_map = self.get_reference_feedback()
@@ -1011,6 +1091,7 @@ class RetrievalMainWindow(QMainWindow):
             f"Accepted 会扩展下一轮查询, Rejected 会抑制下一轮相似结果"
         )
         self.update_history_summary()
+        self.update_gallery_stats()
         self.update_feedback_summary()
         self.render_results()
         self.start_button.setEnabled(True)
@@ -1064,6 +1145,7 @@ class RetrievalMainWindow(QMainWindow):
     def toggle_accept_for_card(self, card):
         current_label = card.feedback_label
         next_label = "unlabeled" if current_label == "accepted" else "accepted"
+        self.save_undo_snapshot("单张卡片切换")
         self.save_feedback_label(card.image_path, next_label)
         card.set_feedback_label(next_label)
         self.update_feedback_summary()
@@ -1078,6 +1160,7 @@ class RetrievalMainWindow(QMainWindow):
     def set_feedback_for_displayed(self, label):
         if self.display_df.empty or not self.card_widgets:
             return
+        self.save_undo_snapshot(f"当前页批量设为 {label}")
         changed_count = 0
         for card in self.card_widgets:
             if card.feedback_label != label:
@@ -1091,6 +1174,7 @@ class RetrievalMainWindow(QMainWindow):
     def reject_current_unaccepted(self):
         if self.display_df.empty or not self.card_widgets:
             return
+        self.save_undo_snapshot("当前页未Accept设为Rejected")
         changed_count = 0
         kept_accepted_count = 0
         for card in self.card_widgets:
@@ -1167,41 +1251,35 @@ class RetrievalMainWindow(QMainWindow):
             self.log(f"{action_text} | score={float(row['similarity_score']):.6f} | {source_path} -> {target_path}")
         save_gui_history(self.gui_history)
         self.update_history_summary()
+        self.update_gallery_stats()
         QMessageBox.information(self, "复制完成", f"已复制 {copied_count} 张；同名目标已自动覆盖。")
         self.log(f"复制完成 | copied_count={copied_count} | overwrite_mode=true")
         self.refresh_display_results()
         self.queue_feedback_rerun("复制 Accepted 图片")
 
     def delete_copied_source_files(self):
-        context = self.get_current_context_paths()
         pending_records = [record for record in self.gui_history.get("copy_records", []) if not record.get("deleted_at")]
-        scoped_records = [record for record in pending_records if self.is_current_context_record(record)]
-        if not scoped_records:
+        if not pending_records:
             QMessageBox.information(
                 self,
                 "没有可删除源图",
-                "当前保存目录 / 当前参考图 / 当前图库组合下，没有可删除的已复制源图。\n"
-                f"当前图库目录: {self.gallery_edit.text().strip() or '未设置'}\n"
-                f"上次删除数量: {int(self.gui_history.get('last_deleted_count', 0))} 张",
+                "当前没有带历史记录的已复制源图。",
             )
             return
         result = QMessageBox.question(
             self,
             "确认删除",
-            f"将删除当前上下文下的 {len(scoped_records)} 个已复制对应源文件。\n"
-            f"参考图: {self.reference_edit.text().strip() or '未设置'}\n"
-            f"图库目录: {self.gallery_edit.text().strip() or '未设置'}\n"
-            f"保存目录: {self.target_edit.text().strip() or '未设置'}\n"
-            "说明: 只删除图库里的源文件，已复制到保存目录的副本会保留。\n"
-            f"上次删除数量: {int(self.gui_history.get('last_deleted_count', 0))} 张\n\n是否继续？",
+            f"将处理全部 {len(pending_records)} 条已复制源图记录。\n"
+            "执行方式：如果源图仍存在，则以覆盖方式移动到目标位置；\n"
+            "如果目标副本已存在，则直接覆盖；完成后源图会从图库中消失。\n\n是否继续？",
         )
         if result != QMessageBox.Yes:
             return
 
-        deleted_count = 0
+        moved_count = 0
         skipped_count = 0
         deleted_at = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
-        for record in scoped_records:
+        for record in pending_records:
             source_path = record.get("source_path", "")
             target_path = record.get("target_path", "")
             can_delete, reason = self.can_safely_delete_source_record(record)
@@ -1212,27 +1290,30 @@ class RetrievalMainWindow(QMainWindow):
                     f"reason={reason} | source={source_path} | target={target_path}"
                 )
                 continue
+
             if source_path and os.path.isfile(source_path):
-                os.remove(source_path)
-                deleted_count += 1
-                self.log(f"删除图库源文件: {source_path} | 保留副本: {target_path}")
+                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                if os.path.isfile(target_path):
+                    os.remove(target_path)
+                shutil.move(source_path, target_path)
+                moved_count += 1
+                self.log(f"移动图库源文件: {source_path} -> {target_path} | overwrite=true")
             else:
-                self.log(f"图库源文件不存在，按已清理处理: {source_path} | 副本保留: {target_path}")
+                self.log(f"图库源文件不存在，按已处理记录清理: {source_path} | 目标保留: {target_path}")
             record["deleted_at"] = deleted_at
-        self.gui_history["last_deleted_count"] = deleted_count
+        self.gui_history["last_deleted_count"] = moved_count
         save_gui_history(self.gui_history)
         self.update_history_summary()
+        self.update_gallery_stats()
         self.refresh_display_results()
         QMessageBox.information(
             self,
             "删除完成",
-            f"本次删除 {deleted_count} 张图库源图，跳过 {skipped_count} 张不安全记录。\n"
-            f"上次删除按钮执行删除数量已更新为 {deleted_count} 张。",
+            f"本次处理 {len(pending_records)} 条记录，移动 {moved_count} 张源图，跳过 {skipped_count} 张异常记录。",
         )
         self.log(
-            "删除图库源文件完成 | "
-            f"deleted_count={deleted_count} | skipped_count={skipped_count} | "
-            f"reference={context['reference_path']} | gallery={context['gallery_path']} | target={context['target_dir']}"
+            "删除已复制源图完成 | "
+            f"processed_count={len(pending_records)} | moved_count={moved_count} | skipped_count={skipped_count}"
         )
 
 
