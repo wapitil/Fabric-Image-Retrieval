@@ -42,3 +42,10 @@ dinov2_retrieval_result/
 
 # Model weights
 *.pth
+
+# images
+*.png
+*.bmp
+
+# labels
+*.txt
