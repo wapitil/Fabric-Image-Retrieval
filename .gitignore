@@ -39,6 +39,7 @@ Thumbs.db
 
 # Local output / generated files
 dinov2_retrieval_result/
+Data/
 
 # Model weights
 *.pth
@@ -49,3 +50,5 @@ dinov2_retrieval_result/
 
 # labels
 *.txt
+.python-version
+uv.lock
